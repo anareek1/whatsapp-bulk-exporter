@@ -1,0 +1,38 @@
+profiles:
+  - name: "phone01"
+    label: "Business Line 1"
+  - name: "phone02"
+    label: "Business Line 2"
+  - name: "phone03"
+    label: "Business Line 3"
+  - name: "phone04"
+    label: "Business Line 4"
+  - name: "phone05"
+    label: "Business Line 5"
+  - name: "phone06"
+    label: "Business Line 6"
+  - name: "phone07"
+    label: "Business Line 7"
+  - name: "phone08"
+    label: "Business Line 8"
+  - name: "phone09"
+    label: "Business Line 9"
+  - name: "phone10"
+    label: "Business Line 10"
+  - name: "phone11"
+    label: "Business Line 11"
+  - name: "phone12"
+    label: "Business Line 12"
+  - name: "phone13"
+    label: "Business Line 13"
+  - name: "phone14"
+    label: "Business Line 14"
+  - name: "phone15"
+    label: "Business Line 15"
+
+settings:
+  scroll_pause: 1.5
+  message_load_pause: 2.0
+  max_scroll_attempts: 50
+  headless: false
+  export_format: "json"  # json or csv
