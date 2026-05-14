@@ -4,7 +4,7 @@
 import argparse
 import csv
 import json
-import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -15,6 +15,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -34,12 +35,17 @@ def create_driver(profile_name, headless=False):
     profile_path = PROFILES_DIR / profile_name
     profile_path.mkdir(parents=True, exist_ok=True)
 
+    lock_file = profile_path / "SingletonLock"
+    if lock_file.exists():
+        lock_file.unlink()
+
     options = Options()
     options.add_argument(f"--user-data-dir={profile_path}")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--remote-debugging-port=0")
     if headless:
         options.add_argument("--headless=new")
 
@@ -48,7 +54,6 @@ def create_driver(profile_name, headless=False):
 
 
 def wait_for_login(driver, timeout=120):
-    """Wait until WhatsApp Web is fully loaded (QR scanned or session restored)."""
     print("Waiting for WhatsApp Web to load...")
     print("If this is the first time, scan the QR code with your phone.")
     print(f"You have {timeout} seconds...\n")
@@ -57,29 +62,85 @@ def wait_for_login(driver, timeout=120):
             EC.presence_of_element_located((By.CSS_SELECTOR, '#pane-side'))
         )
         print("Logged in successfully!\n")
-        time.sleep(3)
+        time.sleep(5)
         return True
     except Exception:
         print("ERROR: Timed out waiting for login.")
         return False
 
 
-def get_chat_list(driver):
-    """Get all chat elements from the side panel."""
-    pane = driver.find_element(By.CSS_SELECTOR, '#pane-side')
+def find_and_click_chat(driver, chat_name):
+    """Find a chat by name in the sidebar and click it using JS."""
+    clicked = driver.execute_script("""
+        const target = arguments[0];
+        const pane = document.querySelector('#pane-side');
+        if (!pane) return false;
+        const spans = pane.querySelectorAll('span[title]');
+        for (const span of spans) {
+            if (span.getAttribute('title') === target) {
+                span.closest('[role="row"]').click();
+                return true;
+            }
+        }
+        return false;
+    """, chat_name)
 
-    chat_titles = set()
+    if clicked:
+        time.sleep(2)
+        return bool(driver.find_elements(By.CSS_SELECTOR, '#main'))
+    return False
+
+
+def scroll_to_chat(driver, chat_name):
+    """Scroll the chat list to find a specific chat, then click it."""
+    pane = driver.find_element(By.CSS_SELECTOR, '#pane-side')
+    chat_list = pane.find_elements(By.CSS_SELECTOR, '[data-testid="chat-list"]')
+    scroll_target = chat_list[0] if chat_list else pane
+
+    driver.execute_script("arguments[0].scrollTop = 0;", scroll_target)
+    time.sleep(0.5)
+
+    for _ in range(100):
+        if find_and_click_chat(driver, chat_name):
+            return True
+        driver.execute_script(
+            "arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].offsetHeight;",
+            scroll_target
+        )
+        time.sleep(0.8)
+
+    return False
+
+
+def get_all_chats_by_scrolling(driver):
+    """Scroll through the entire chat list and collect all chat names with their order."""
+    pane = driver.find_element(By.CSS_SELECTOR, '#pane-side')
+    chat_list = pane.find_elements(By.CSS_SELECTOR, '[data-testid="chat-list"]')
+    scroll_target = chat_list[0] if chat_list else pane
+
+    driver.execute_script("arguments[0].scrollTop = 0;", scroll_target)
+    time.sleep(1)
+
+    chat_titles = []
+    seen = set()
     last_count = 0
     stable_rounds = 0
 
     while stable_rounds < 3:
-        chats = pane.find_elements(By.CSS_SELECTOR, '[role="listitem"]')
-        for chat in chats:
+        rows = pane.find_elements(By.CSS_SELECTOR, '[role="row"]')
+        for row in rows:
             try:
-                title_el = chat.find_element(By.CSS_SELECTOR, 'span[title]')
-                title = title_el.get_attribute("title")
-                if title:
-                    chat_titles.add(title)
+                container = row.find_elements(
+                    By.CSS_SELECTOR, '[data-testid="cell-frame-container"]'
+                )
+                if not container:
+                    continue
+                title_els = container[0].find_elements(By.CSS_SELECTOR, 'span[title]')
+                if title_els:
+                    title = title_els[0].get_attribute("title")
+                    if title and title not in seen:
+                        seen.add(title)
+                        chat_titles.append(title)
             except Exception:
                 continue
 
@@ -91,69 +152,109 @@ def get_chat_list(driver):
 
         driver.execute_script(
             "arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].offsetHeight;",
-            pane
+            scroll_target
         )
         time.sleep(1.5)
 
-    driver.execute_script("arguments[0].scrollTop = 0;", pane)
+    driver.execute_script("arguments[0].scrollTop = 0;", scroll_target)
     time.sleep(1)
 
-    return sorted(chat_titles)
+    return chat_titles
 
 
-def search_and_open_chat(driver, chat_name):
-    """Use the search bar to find and open a specific chat."""
-    try:
-        search_box = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, 'div[contenteditable="true"][data-tab="3"]')
-            )
-        )
-        search_box.click()
-        time.sleep(0.5)
+def iterate_and_export_chats(driver, export_dir, fmt, max_scroll, msg_pause):
+    """Scroll through chat list, clicking each chat row directly to export."""
+    pane = driver.find_element(By.CSS_SELECTOR, '#pane-side')
+    chat_list = pane.find_elements(By.CSS_SELECTOR, '[data-testid="chat-list"]')
+    scroll_target = chat_list[0] if chat_list else pane
 
-        search_box.clear()
-        search_box.send_keys(chat_name)
-        time.sleep(2)
+    driver.execute_script("arguments[0].scrollTop = 0;", scroll_target)
+    time.sleep(1)
 
-        results = driver.find_elements(By.CSS_SELECTOR, '#pane-side [role="listitem"]')
-        for result in results:
+    exported = set()
+    summary = {"total": 0, "exported": 0, "failed": 0, "chats": []}
+    stable_rounds = 0
+    last_exported_count = 0
+
+    while stable_rounds < 3:
+        rows = pane.find_elements(By.CSS_SELECTOR, '[role="row"]')
+        for row in rows:
             try:
-                title_el = result.find_element(By.CSS_SELECTOR, 'span[title]')
-                if title_el.get_attribute("title") == chat_name:
-                    result.click()
-                    time.sleep(2)
-                    search_box.send_keys(Keys.ESCAPE)
-                    time.sleep(0.5)
-                    return True
-            except Exception:
-                continue
+                container = row.find_elements(
+                    By.CSS_SELECTOR, '[data-testid="cell-frame-container"]'
+                )
+                if not container:
+                    continue
+                title_els = container[0].find_elements(By.CSS_SELECTOR, 'span[title]')
+                if not title_els:
+                    continue
+                chat_name = title_els[0].get_attribute("title")
+                if not chat_name or chat_name in exported:
+                    continue
 
-        search_box.send_keys(Keys.ESCAPE)
-        return False
-    except Exception as e:
-        print(f"  Could not open chat: {e}")
-        return False
+                exported.add(chat_name)
+                summary["total"] += 1
+                idx = summary["total"]
+                print(f"[{idx}] {chat_name}")
+
+                try:
+                    ActionChains(driver).move_to_element(title_els[0]).click().perform()
+                except Exception:
+                    row.click()
+                time.sleep(2)
+
+                if not driver.find_elements(By.CSS_SELECTOR, '#main'):
+                    print("  SKIPPED: chat did not open")
+                    summary["failed"] += 1
+                    continue
+
+                scroll_chat_to_top(driver, max_attempts=max_scroll, pause=msg_pause)
+                messages = extract_messages(driver)
+                print(f"  Extracted {len(messages)} messages")
+
+                if messages:
+                    filepath = save_chat(chat_name, messages, export_dir, fmt=fmt)
+                    print(f"  Saved to {filepath.name}")
+                    summary["exported"] += 1
+                    summary["chats"].append({
+                        "name": chat_name, "messages": len(messages)
+                    })
+                else:
+                    print("  SKIPPED: no messages")
+                    summary["failed"] += 1
+
+            except Exception as e:
+                print(f"  ERROR: {e}")
+                summary["failed"] += 1
+
+        if len(exported) == last_exported_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+            last_exported_count = len(exported)
+
+        driver.execute_script(
+            "arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].offsetHeight;",
+            scroll_target
+        )
+        time.sleep(1.5)
+
+    return summary
 
 
 def scroll_chat_to_top(driver, max_attempts=50, pause=2.0):
-    """Scroll up in the chat to load older messages."""
-    print("  Loading message history...", end="", flush=True)
+    print("  Loading history...", end="", flush=True)
     attempts = 0
     last_height = None
 
     while attempts < max_attempts:
         try:
-            msg_pane = driver.find_element(
-                By.CSS_SELECTOR, 'div[role="application"]'
-            )
+            msg_pane = driver.find_element(By.CSS_SELECTOR, '#main [role="application"]')
             current_height = driver.execute_script(
                 "return arguments[0].scrollHeight;", msg_pane
             )
-
             if current_height == last_height:
                 break
-
             last_height = current_height
             driver.execute_script("arguments[0].scrollTop = 0;", msg_pane)
             time.sleep(pause)
@@ -166,16 +267,17 @@ def scroll_chat_to_top(driver, max_attempts=50, pause=2.0):
 
 
 def extract_messages(driver):
-    """Extract all visible messages from the current chat."""
     messages = []
     try:
-        msg_elements = driver.find_elements(
-            By.CSS_SELECTOR, 'div[role="row"]'
-        )
+        main = driver.find_element(By.CSS_SELECTOR, '#main')
+        msg_rows = main.find_elements(By.CSS_SELECTOR, '[role="row"]')
 
-        for msg_el in msg_elements:
+        for row in msg_rows:
             try:
-                msg_data = extract_single_message(msg_el)
+                raw_text = row.text.strip()
+                if not raw_text:
+                    continue
+                msg_data = parse_message_text(raw_text)
                 if msg_data:
                     messages.append(msg_data)
             except Exception:
@@ -186,58 +288,42 @@ def extract_messages(driver):
     return messages
 
 
-def extract_single_message(msg_el):
-    """Parse a single message row into structured data."""
-    text = ""
-    sender = ""
+def parse_message_text(raw_text):
+    lines = raw_text.split("\n")
+    if not lines:
+        return None
+
     timestamp = ""
     msg_type = "text"
 
-    copyable = msg_el.find_elements(By.CSS_SELECTOR, 'span.copyable-text')
-    if copyable:
-        data_pre = copyable[0].get_attribute("data-pre-plain-text") or ""
-        if data_pre:
-            parts = data_pre.strip("[]").split("] ", 1)
-            if len(parts) == 2:
-                timestamp = parts[0].strip("[ ")
-                sender = parts[1].strip(": ")
+    last_line = lines[-1].strip()
+    time_match = re.search(r'(\d{1,2}:\d{2})', last_line)
+    if time_match:
+        timestamp = time_match.group(1)
 
-    selectable = msg_el.find_elements(
-        By.CSS_SELECTOR, 'span.selectable-text'
-    )
-    if selectable:
-        text = selectable[0].text
-    else:
-        img = msg_el.find_elements(By.CSS_SELECTOR, 'img[src*="blob"]')
-        if img:
-            msg_type = "image"
-            text = "[Image]"
-        video = msg_el.find_elements(By.CSS_SELECTOR, 'span[data-icon="video-pip"]')
-        if video:
-            msg_type = "video"
-            text = "[Video]"
-        doc = msg_el.find_elements(By.CSS_SELECTOR, 'span[data-icon="document"]')
-        if doc:
-            msg_type = "document"
-            text = "[Document]"
-        audio = msg_el.find_elements(By.CSS_SELECTOR, 'span[data-icon="audio-play"]')
-        if audio:
-            msg_type = "audio"
-            text = "[Audio]"
+    text_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r'^\d{1,2}:\d{2}$', stripped):
+            continue
+        if stripped in ("Изменено", "Edited"):
+            continue
+        text_lines.append(stripped)
 
-    if not text and not timestamp:
+    text = "\n".join(text_lines)
+    if not text:
         return None
 
     return {
         "timestamp": timestamp,
-        "sender": sender,
         "text": text,
         "type": msg_type,
     }
 
 
 def save_chat(chat_name, messages, export_dir, fmt="json"):
-    """Save extracted messages to file."""
     safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in chat_name)
     safe_name = safe_name.strip()[:100]
 
@@ -252,21 +338,19 @@ def save_chat(chat_name, messages, export_dir, fmt="json"):
     elif fmt == "csv":
         filepath = export_dir / f"{safe_name}.csv"
         with open(filepath, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["timestamp", "sender", "text", "type"])
+            writer = csv.DictWriter(f, fieldnames=["timestamp", "text", "type"])
             writer.writeheader()
             writer.writerows(messages)
     else:
         filepath = export_dir / f"{safe_name}.txt"
         with open(filepath, "w", encoding="utf-8") as f:
             for msg in messages:
-                line = f"[{msg['timestamp']}] {msg['sender']}: {msg['text']}"
-                f.write(line + "\n")
+                f.write(f"[{msg['timestamp']}] {msg['text']}\n")
 
     return filepath
 
 
 def export_profile(profile_cfg, settings):
-    """Run the full export for one WhatsApp profile."""
     name = profile_cfg["name"]
     label = profile_cfg.get("label", name)
     fmt = settings.get("export_format", "json")
@@ -289,34 +373,8 @@ def export_profile(profile_cfg, settings):
         if not wait_for_login(driver):
             return
 
-        print("Scanning chat list...")
-        chat_names = get_chat_list(driver)
-        print(f"Found {len(chat_names)} chats\n")
-
-        summary = {"total": len(chat_names), "exported": 0, "failed": 0, "chats": []}
-
-        for i, chat_name in enumerate(chat_names, 1):
-            print(f"[{i}/{len(chat_names)}] {chat_name}")
-
-            if not search_and_open_chat(driver, chat_name):
-                print("  SKIPPED: could not open chat")
-                summary["failed"] += 1
-                continue
-
-            scroll_chat_to_top(driver, max_attempts=max_scroll, pause=msg_pause)
-            messages = extract_messages(driver)
-            print(f"  Extracted {len(messages)} messages")
-
-            if messages:
-                filepath = save_chat(chat_name, messages, export_dir, fmt=fmt)
-                print(f"  Saved to {filepath}")
-                summary["exported"] += 1
-                summary["chats"].append({
-                    "name": chat_name, "messages": len(messages)
-                })
-            else:
-                print("  SKIPPED: no messages found")
-                summary["failed"] += 1
+        print("Exporting chats...\n")
+        summary = iterate_and_export_chats(driver, export_dir, fmt, max_scroll, msg_pause)
 
         summary_path = export_dir / "_summary.json"
         with open(summary_path, "w", encoding="utf-8") as f:
@@ -331,7 +389,6 @@ def export_profile(profile_cfg, settings):
 
 
 def link_profile(profile_name):
-    """Open WhatsApp Web for QR code scanning only."""
     print(f"Opening WhatsApp Web for profile: {profile_name}")
     print("Scan the QR code, then close the browser.\n")
 
@@ -343,7 +400,10 @@ def link_profile(profile_name):
     else:
         print("Login failed or timed out.")
 
-    input("Press Enter to close the browser...")
+    try:
+        input("Press Enter to close the browser...")
+    except EOFError:
+        pass
     driver.quit()
 
 
@@ -352,7 +412,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     link_parser = subparsers.add_parser("link", help="Link a phone by scanning QR code")
-    link_parser.add_argument("profile", help="Profile name (e.g. phone01)")
+    link_parser.add_argument("profile", help="Profile name (e.g. andrea)")
 
     export_parser = subparsers.add_parser("export", help="Export chats from a linked profile")
     export_parser.add_argument("profile", nargs="?", help="Profile name (omit for all)")
