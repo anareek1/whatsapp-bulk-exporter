@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import re
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -386,6 +387,36 @@ def export_profile(profile_cfg, settings):
 
     finally:
         driver.quit()
+        cleanup_profile_cache(name)
+
+
+def cleanup_profile_cache(profile_name):
+    """Delete Chrome cache dirs to free disk space. Keeps the session alive."""
+    profile_path = PROFILES_DIR / profile_name
+    cache_dirs = [
+        "Default/Cache",
+        "Default/Code Cache",
+        "Default/Service Worker/CacheStorage",
+        "Default/GPUCache",
+        "GrShaderCache",
+        "GraphiteDawnCache",
+        "BrowserMetrics",
+        "BrowserMetrics-spare.pma",
+        "CrashpadMetrics-active.pma",
+    ]
+    freed = 0
+    for d in cache_dirs:
+        target = profile_path / d
+        if target.is_dir():
+            size = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+            shutil.rmtree(target, ignore_errors=True)
+            freed += size
+        elif target.is_file():
+            freed += target.stat().st_size
+            target.unlink(missing_ok=True)
+
+    if freed:
+        print(f"  Cleaned {freed / 1024 / 1024:.0f} MB of cache from {profile_name}")
 
 
 def link_profile(profile_name):
@@ -405,6 +436,7 @@ def link_profile(profile_name):
     except EOFError:
         pass
     driver.quit()
+    cleanup_profile_cache(profile_name)
 
 
 def main():
