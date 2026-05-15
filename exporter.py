@@ -275,10 +275,7 @@ def extract_messages(driver):
 
         for row in msg_rows:
             try:
-                raw_text = row.text.strip()
-                if not raw_text:
-                    continue
-                msg_data = parse_message_text(raw_text)
+                msg_data = extract_single_message(driver, row)
                 if msg_data:
                     messages.append(msg_data)
             except Exception:
@@ -289,39 +286,101 @@ def extract_messages(driver):
     return messages
 
 
-def parse_message_text(raw_text):
-    lines = raw_text.split("\n")
-    if not lines:
-        return None
+def extract_single_message(driver, row):
+    info = driver.execute_script("""
+        const row = arguments[0];
 
-    timestamp = ""
-    msg_type = "text"
+        // Skip system messages
+        if (row.querySelector('[data-testid="system_message"]')) return null;
 
-    last_line = lines[-1].strip()
-    time_match = re.search(r'(\d{1,2}:\d{2})', last_line)
-    if time_match:
-        timestamp = time_match.group(1)
+        const result = {sender: '', date: '', time: '', text: '', direction: ''};
 
-    text_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if re.match(r'^\d{1,2}:\d{2}$', stripped):
-            continue
-        if stripped in ("Изменено", "Edited"):
-            continue
-        text_lines.append(stripped)
+        // Get sender, date, time from data-pre-plain-text
+        const copyable = row.querySelector('.copyable-text');
+        if (copyable) {
+            const pre = copyable.getAttribute('data-pre-plain-text') || '';
+            // Format: [HH:MM, DD.MM.YYYY] Sender:
+            const match = pre.match(/\\[(\\d{1,2}:\\d{2}),\\s*([^\\]]+)\\]\\s*(.+?):\\s*$/);
+            if (match) {
+                result.time = match[1];
+                result.date = match[2].trim();
+                result.sender = match[3].trim();
+            }
+        }
 
-    text = "\n".join(text_lines)
-    if not text:
-        return None
+        // Direction from aria-label
+        const ariaEls = row.querySelectorAll('[aria-label]');
+        for (const el of ariaEls) {
+            const label = el.getAttribute('aria-label');
+            if (label && label.startsWith('Вы:')) { result.direction = 'out'; break; }
+            if (label && label.startsWith('You:')) { result.direction = 'out'; break; }
+        }
+        if (!result.direction) {
+            if (row.querySelector('[data-testid="tail-out"]')) result.direction = 'out';
+            else if (row.querySelector('[data-testid="tail-in"]')) result.direction = 'in';
+        }
 
-    return {
-        "timestamp": timestamp,
-        "text": text,
-        "type": msg_type,
-    }
+        // Media type detection (before text, so we can set clean text for media)
+        result.type = 'text';
+        const isDoc = row.querySelector('[data-testid*="document"]');
+        const isImage = row.querySelector('[data-testid*="image"]');
+        const isVideo = row.querySelector('[data-testid*="video"]');
+        const isAudio = row.querySelector('[data-testid*="ptt"]') || row.querySelector('[data-testid*="audio"]');
+        const isSticker = row.querySelector('[data-testid*="sticker"]');
+
+        if (isDoc) result.type = 'document';
+        else if (isImage) result.type = 'image';
+        else if (isVideo) result.type = 'video';
+        else if (isAudio) result.type = 'audio';
+        else if (isSticker) result.type = 'sticker';
+
+        // Text content
+        const selectable = row.querySelector('[data-testid="selectable-text"]');
+        if (selectable) {
+            result.text = selectable.textContent.trim();
+        }
+
+        // Clean text for media types
+        if (result.type === 'audio') {
+            // Extract time from ptt-status if available
+            const pttTime = row.querySelector('[data-testid="msg-meta"]');
+            const timeText = pttTime ? pttTime.textContent.trim() : '';
+            if (!result.time && timeText) {
+                const tm = timeText.match(/(\\d{1,2}:\\d{2})/);
+                if (tm) result.time = tm[1];
+            }
+            result.text = '[Audio]';
+        } else if (result.type === 'document') {
+            // Try to get filename
+            const docTitle = row.querySelector('[data-testid="document-thumb"]');
+            const spans = row.querySelectorAll('span');
+            let filename = '';
+            for (const s of spans) {
+                const t = s.textContent.trim();
+                if (t && (t.endsWith('.pdf') || t.endsWith('.docx') || t.endsWith('.xlsx') ||
+                    t.endsWith('.doc') || t.endsWith('.csv') || t.endsWith('.zip') || t.endsWith('.txt'))) {
+                    filename = t;
+                    break;
+                }
+            }
+            result.text = filename ? '[Document: ' + filename + ']' : '[Document]';
+        } else if (result.type === 'image') {
+            if (!result.text) result.text = '[Image]';
+        } else if (result.type === 'video') {
+            if (!result.text) result.text = '[Video]';
+        } else if (result.type === 'sticker') {
+            result.text = '[Sticker]';
+        } else if (!result.text) {
+            // Fallback: no selectable text and not media
+            return null;
+        }
+
+        if (!result.text && !result.time) return null;
+
+        return result;
+    """, row)
+
+    return info
 
 
 def save_chat(chat_name, messages, export_dir, fmt="json"):
@@ -339,14 +398,16 @@ def save_chat(chat_name, messages, export_dir, fmt="json"):
     elif fmt == "csv":
         filepath = export_dir / f"{safe_name}.csv"
         with open(filepath, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["timestamp", "text", "type"])
+            writer = csv.DictWriter(
+                f, fieldnames=["date", "time", "sender", "direction", "text", "type"]
+            )
             writer.writeheader()
             writer.writerows(messages)
     else:
         filepath = export_dir / f"{safe_name}.txt"
         with open(filepath, "w", encoding="utf-8") as f:
             for msg in messages:
-                f.write(f"[{msg['timestamp']}] {msg['text']}\n")
+                f.write(f"[{msg.get('date','')} {msg.get('time','')}] {msg.get('sender','')}: {msg.get('text','')}\n")
 
     return filepath
 
